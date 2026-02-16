@@ -1,0 +1,585 @@
+use core::alloc::Layout;
+use core::ptr;
+
+use crate::ring::{RecentAlloc, RingBuffer};
+
+pub(crate) struct ScopedBumpInner<const N: usize> {
+    base: *mut u8,
+    cap: usize,
+    cursor: usize,
+    ring: RingBuffer<N>,
+}
+
+pub struct Mark {
+    pub(crate) cursor: usize,
+}
+
+impl<const N: usize> ScopedBumpInner<N> {
+    pub const fn new_uninit() -> Self {
+        Self {
+            base: core::ptr::null_mut(),
+            cap: 0,
+            cursor: 0,
+            ring: RingBuffer::new(),
+        }
+    }
+
+    pub unsafe fn init(&mut self, base: *mut u8, cap: usize) {
+        assert!(self.base.is_null(), "init called twice");
+        self.base = base;
+        self.cap = cap;
+    }
+
+    pub fn alloc(&mut self, layout: Layout) -> *mut u8 {
+        if layout.size() == 0 {
+            return layout.align() as *mut u8;
+        }
+        let abs_addr = (self.base as usize) + self.cursor;
+        let aligned_addr = match align_up(abs_addr, layout.align()) {
+            Some(v) => v,
+            None => return ptr::null_mut(),
+        };
+        let aligned = aligned_addr - self.base as usize;
+        let end = match aligned.checked_add(layout.size()) {
+            Some(v) if v <= self.cap => v,
+            _ => return ptr::null_mut(),
+        };
+        self.ring.push(RecentAlloc {
+            offset: aligned,
+            size: layout.size(),
+            alive: true,
+        });
+        self.cursor = end;
+        unsafe { self.base.add(aligned) }
+    }
+
+    pub unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
+        if layout.size() == 0 {
+            return;
+        }
+        if (ptr as usize) < (self.base as usize)
+            || (ptr as usize) >= (self.base as usize) + self.cap
+        {
+            return;
+        }
+        let offset = ptr as usize - self.base as usize;
+        let idx = match self.ring.find_by_offset(offset) {
+            Some(i) => i,
+            None => return,
+        };
+        self.ring.mark_dead(idx);
+        if let Some(rewind_to) = self.ring.suffix_rewind_cursor() {
+            self.cursor = rewind_to;
+        }
+    }
+
+    pub unsafe fn realloc(&mut self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if layout.size() == 0 {
+            let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+                Ok(l) => l,
+                Err(_) => return ptr::null_mut(),
+            };
+            return self.alloc(new_layout);
+        }
+        if new_size == 0 {
+            self.dealloc(ptr, layout);
+            return layout.align() as *mut u8;
+        }
+        if (ptr as usize) < (self.base as usize)
+            || (ptr as usize) >= (self.base as usize) + self.cap
+        {
+            return ptr::null_mut();
+        }
+        let offset = ptr as usize - self.base as usize;
+        // Case A: newest alive allocation — try in-place
+        if let Some(newest) = self.ring.newest() {
+            if newest.alive && newest.offset == offset {
+                let new_end = match offset.checked_add(new_size) {
+                    Some(v) if v <= self.cap => v,
+                    _ => return ptr::null_mut(),
+                };
+                self.cursor = new_end;
+                self.ring.update_newest_size(new_size);
+                return ptr;
+            }
+        }
+        // Case B: not newest — alloc new, copy, dealloc old
+        let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+            Ok(l) => l,
+            Err(_) => return ptr::null_mut(),
+        };
+        let new_ptr = self.alloc(new_layout);
+        if new_ptr.is_null() {
+            return ptr::null_mut();
+        }
+        let copy_size = layout.size().min(new_size);
+        ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+        self.dealloc(ptr, layout);
+        new_ptr
+    }
+
+    pub fn mark(&self) -> Mark {
+        Mark {
+            cursor: self.cursor,
+        }
+    }
+
+    pub unsafe fn reset(&mut self, mark: Mark) {
+        if mark.cursor < self.cursor {
+            self.cursor = mark.cursor;
+            self.ring.invalidate_from_offset(mark.cursor);
+        }
+    }
+}
+
+pub(crate) fn align_up(offset: usize, align: usize) -> Option<usize> {
+    debug_assert!(align.is_power_of_two());
+    let mask = align - 1;
+    offset.checked_add(mask).map(|v| v & !mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_bump<const N: usize>(arena: &mut [u8]) -> ScopedBumpInner<N> {
+        let mut bump = ScopedBumpInner::<N>::new_uninit();
+        unsafe { bump.init(arena.as_mut_ptr(), arena.len()) };
+        bump
+    }
+
+    #[test]
+    fn single_alloc() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let layout = Layout::from_size_align(16, 4).unwrap();
+        let ptr = bump.alloc(layout);
+        assert!(!ptr.is_null());
+        let base = arena.as_ptr();
+        assert!(ptr as usize >= base as usize);
+        assert!(ptr as usize + 16 <= base as usize + 1024);
+        assert_eq!((ptr as usize) % 4, 0);
+    }
+
+    #[test]
+    fn sequential_allocs_dont_overlap() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l1 = Layout::from_size_align(16, 4).unwrap();
+        let l2 = Layout::from_size_align(32, 8).unwrap();
+        let p1 = bump.alloc(l1);
+        let p2 = bump.alloc(l2);
+        assert!(!p1.is_null());
+        assert!(!p2.is_null());
+        // p2 starts at or after p1+16
+        assert!(p2 as usize >= p1 as usize + 16);
+        assert_eq!((p2 as usize) % 8, 0);
+    }
+
+    #[test]
+    fn alignment_gaps() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        // alloc 1 byte with align 1
+        let l1 = Layout::from_size_align(1, 1).unwrap();
+        let p1 = bump.alloc(l1);
+        assert!(!p1.is_null());
+        // alloc with align 8 — should skip bytes
+        let l2 = Layout::from_size_align(8, 8).unwrap();
+        let p2 = bump.alloc(l2);
+        assert!(!p2.is_null());
+        assert_eq!((p2 as usize) % 8, 0);
+        assert!(p2 as usize >= p1 as usize + 1);
+    }
+
+    #[test]
+    fn oom_returns_null() {
+        let mut arena = [0u8; 16];
+        let mut bump = make_bump::<8>(&mut arena);
+        let layout = Layout::from_size_align(32, 1).unwrap();
+        let ptr = bump.alloc(layout);
+        assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn oom_after_partial_fill() {
+        let mut arena = [0u8; 32];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l1 = Layout::from_size_align(24, 1).unwrap();
+        let p1 = bump.alloc(l1);
+        assert!(!p1.is_null());
+        let l2 = Layout::from_size_align(16, 1).unwrap();
+        let p2 = bump.alloc(l2);
+        assert!(p2.is_null());
+    }
+
+    #[test]
+    fn dealloc_single_rewinds() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let layout = Layout::from_size_align(16, 1).unwrap();
+        let ptr = bump.alloc(layout);
+        assert_eq!(bump.cursor, 16);
+        unsafe { bump.dealloc(ptr, layout) };
+        assert_eq!(bump.cursor, 0);
+    }
+
+    #[test]
+    fn dealloc_lifo_full_rewind() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        let b = bump.alloc(l);
+        let c = bump.alloc(l);
+        assert_eq!(bump.cursor, 48);
+        unsafe { bump.dealloc(c, l) };
+        assert_eq!(bump.cursor, 32);
+        unsafe { bump.dealloc(b, l) };
+        assert_eq!(bump.cursor, 16);
+        unsafe { bump.dealloc(a, l) };
+        assert_eq!(bump.cursor, 0);
+    }
+
+    #[test]
+    fn dealloc_middle_no_rewind() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        let _b = bump.alloc(l);
+        let _c = bump.alloc(l);
+        assert_eq!(bump.cursor, 48);
+        unsafe { bump.dealloc(a, l) };
+        assert_eq!(bump.cursor, 48);
+    }
+
+    #[test]
+    fn dealloc_out_of_order_then_rewind() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let _a = bump.alloc(l);
+        let b = bump.alloc(l);
+        let c = bump.alloc(l);
+        // dealloc C then B: after C, cursor rewinds to 32; after B, to 16
+        unsafe { bump.dealloc(c, l) };
+        assert_eq!(bump.cursor, 32);
+        unsafe { bump.dealloc(b, l) };
+        assert_eq!(bump.cursor, 16);
+    }
+
+    #[test]
+    fn dealloc_evicted_ptr_is_noop() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<2>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        let _b = bump.alloc(l);
+        let _c = bump.alloc(l); // evicts a from ring
+        let cursor_before = bump.cursor;
+        unsafe { bump.dealloc(a, l) };
+        assert_eq!(bump.cursor, cursor_before);
+    }
+
+    #[test]
+    fn double_dealloc_is_noop() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        unsafe { bump.dealloc(a, l) };
+        assert_eq!(bump.cursor, 0);
+        // second dealloc: already dead, find_by_offset returns None
+        unsafe { bump.dealloc(a, l) };
+        assert_eq!(bump.cursor, 0);
+    }
+
+    #[test]
+    fn realloc_in_place_grow() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let ptr = bump.alloc(l);
+        unsafe { ptr::write_bytes(ptr, 0xAA, 16) };
+        let new_ptr = unsafe { bump.realloc(ptr, l, 32) };
+        assert_eq!(new_ptr, ptr);
+        assert_eq!(bump.cursor, 32);
+        // old data preserved
+        for i in 0..16 {
+            assert_eq!(unsafe { *new_ptr.add(i) }, 0xAA);
+        }
+    }
+
+    #[test]
+    fn realloc_in_place_shrink() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(32, 1).unwrap();
+        let ptr = bump.alloc(l);
+        let new_ptr = unsafe { bump.realloc(ptr, l, 8) };
+        assert_eq!(new_ptr, ptr);
+        assert_eq!(bump.cursor, 8);
+    }
+
+    #[test]
+    fn realloc_fallback_not_newest() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        unsafe { ptr::write_bytes(a, 0xBB, 16) };
+        let _b = bump.alloc(l);
+        // realloc a (not newest) -> fallback
+        let new_a = unsafe { bump.realloc(a, l, 32) };
+        assert!(!new_a.is_null());
+        assert_ne!(new_a, a);
+        // old data preserved in min(16, 32) = 16 bytes
+        for i in 0..16 {
+            assert_eq!(unsafe { *new_a.add(i) }, 0xBB);
+        }
+    }
+
+    #[test]
+    fn realloc_grow_past_cap() {
+        let mut arena = [0u8; 64];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(32, 1).unwrap();
+        let ptr = bump.alloc(l);
+        assert!(!ptr.is_null());
+        let new_ptr = unsafe { bump.realloc(ptr, l, 128) };
+        assert!(new_ptr.is_null());
+    }
+
+    #[test]
+    fn realloc_after_dealloc_of_newest_uses_fallback() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        let b = bump.alloc(l);
+        unsafe { ptr::write_bytes(a, 0xCC, 16) };
+        // dealloc b (newest), so newest in ring is now dead
+        unsafe { bump.dealloc(b, l) };
+        // realloc a: newest is dead, so alive check fails -> fallback
+        let new_a = unsafe { bump.realloc(a, l, 32) };
+        assert!(!new_a.is_null());
+        for i in 0..16 {
+            assert_eq!(unsafe { *new_a.add(i) }, 0xCC);
+        }
+    }
+
+    #[test]
+    fn mark_reset_basic() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let _a = bump.alloc(l);
+        let mark = bump.mark();
+        let _b = bump.alloc(l);
+        let _c = bump.alloc(l);
+        assert_eq!(bump.cursor, 48);
+        unsafe { bump.reset(mark) };
+        assert_eq!(bump.cursor, 16);
+    }
+
+    #[test]
+    fn mark_reset_already_rewound() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let _a = bump.alloc(l);
+        let mark = bump.mark();
+        let b = bump.alloc(l);
+        // dealloc b rewinds cursor to 16 = mark.cursor
+        unsafe { bump.dealloc(b, l) };
+        assert_eq!(bump.cursor, 16);
+        // reset is no-op since cursor == mark.cursor
+        unsafe { bump.reset(mark) };
+        assert_eq!(bump.cursor, 16);
+    }
+
+    #[test]
+    fn nested_marks() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let mark1 = bump.mark();
+        let _a = bump.alloc(l);
+        let mark2 = bump.mark();
+        let _b = bump.alloc(l);
+        assert_eq!(bump.cursor, 32);
+        unsafe { bump.reset(mark2) };
+        assert_eq!(bump.cursor, 16);
+        // alloc again after inner reset
+        let _c = bump.alloc(l);
+        assert_eq!(bump.cursor, 32);
+        unsafe { bump.reset(mark1) };
+        assert_eq!(bump.cursor, 0);
+    }
+
+    #[test]
+    fn reset_to_zero_invalidates_all() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let mark = bump.mark();
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let _a = bump.alloc(l);
+        let _b = bump.alloc(l);
+        unsafe { bump.reset(mark) };
+        assert_eq!(bump.cursor, 0);
+        // can alloc from beginning again
+        let c = bump.alloc(l);
+        assert!(!c.is_null());
+        assert_eq!(bump.cursor, 16);
+    }
+
+    #[test]
+    fn align_up_already_aligned() {
+        assert_eq!(align_up(0, 1), Some(0));
+        assert_eq!(align_up(0, 8), Some(0));
+        assert_eq!(align_up(8, 8), Some(8));
+        assert_eq!(align_up(16, 4), Some(16));
+    }
+
+    #[test]
+    fn align_up_needs_padding() {
+        assert_eq!(align_up(1, 4), Some(4));
+        assert_eq!(align_up(5, 8), Some(8));
+        assert_eq!(align_up(9, 4), Some(12));
+        assert_eq!(align_up(7, 8), Some(8));
+    }
+
+    #[test]
+    fn align_up_overflow() {
+        assert_eq!(align_up(usize::MAX, 8), None);
+        assert_eq!(align_up(usize::MAX - 1, 8), None);
+        assert_eq!(align_up(usize::MAX - 6, 8), None);
+    }
+
+    #[test]
+    fn align_up_align_1() {
+        assert_eq!(align_up(0, 1), Some(0));
+        assert_eq!(align_up(1, 1), Some(1));
+        assert_eq!(align_up(usize::MAX, 1), Some(usize::MAX));
+    }
+
+    #[test]
+    fn zst_alloc_returns_aligned_non_null() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let layout = Layout::from_size_align(0, 4).unwrap();
+        let ptr = bump.alloc(layout);
+        assert!(!ptr.is_null());
+        assert_eq!((ptr as usize) % 4, 0);
+    }
+
+    #[test]
+    fn zst_alloc_does_not_advance_cursor() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let zst = Layout::from_size_align(0, 1).unwrap();
+        let cursor_before = bump.cursor;
+        let _ = bump.alloc(zst);
+        let _ = bump.alloc(zst);
+        let _ = bump.alloc(zst);
+        assert_eq!(bump.cursor, cursor_before);
+    }
+
+    #[test]
+    fn zst_dealloc_is_noop() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let zst = Layout::from_size_align(0, 4).unwrap();
+        let ptr = bump.alloc(zst);
+        let cursor_before = bump.cursor;
+        unsafe { bump.dealloc(ptr, zst) };
+        assert_eq!(bump.cursor, cursor_before);
+    }
+
+    #[test]
+    fn realloc_from_zst_to_sized() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let zst = Layout::from_size_align(0, 4).unwrap();
+        let ptr = bump.alloc(zst);
+        let new_ptr = unsafe { bump.realloc(ptr, zst, 32) };
+        assert!(!new_ptr.is_null());
+        assert_eq!((new_ptr as usize) % 4, 0);
+        assert_eq!(bump.cursor, 32);
+    }
+
+    #[test]
+    fn realloc_from_sized_to_zst() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let layout = Layout::from_size_align(16, 4).unwrap();
+        let ptr = bump.alloc(layout);
+        assert!(!ptr.is_null());
+        let new_ptr = unsafe { bump.realloc(ptr, layout, 0) };
+        assert!(!new_ptr.is_null());
+        assert_eq!((new_ptr as usize) % 4, 0);
+        // cursor should have rewound since we deallocated the only allocation
+        assert_eq!(bump.cursor, 0);
+    }
+
+    #[test]
+    fn alloc_alignment_with_misaligned_base() {
+        let mut arena = [0u8; 1025];
+        let base = arena.as_mut_ptr();
+        // Ensure base is NOT 8-byte aligned
+        let offset = if (base as usize) % 8 == 0 { 1 } else { 0 };
+        let misaligned_base = unsafe { base.add(offset) };
+        assert_ne!((misaligned_base as usize) % 8, 0);
+
+        let mut bump = ScopedBumpInner::<8>::new_uninit();
+        unsafe { bump.init(misaligned_base, 1024) };
+
+        let layout = Layout::from_size_align(16, 8).unwrap();
+        let ptr = bump.alloc(layout);
+        assert!(!ptr.is_null());
+        assert_eq!(
+            (ptr as usize) % 8,
+            0,
+            "alloc returned misaligned pointer: {:p} (base={:p})",
+            ptr,
+            misaligned_base
+        );
+    }
+
+    #[test]
+    fn sequential_allocs_aligned_with_misaligned_base() {
+        let mut arena = [0u8; 2049];
+        let base = arena.as_mut_ptr();
+        let offset = if (base as usize) % 16 == 0 { 1 } else { 0 };
+        let misaligned_base = unsafe { base.add(offset) };
+
+        let mut bump = ScopedBumpInner::<8>::new_uninit();
+        unsafe { bump.init(misaligned_base, 2048) };
+
+        let l1 = Layout::from_size_align(7, 1).unwrap();
+        let l2 = Layout::from_size_align(16, 16).unwrap();
+        let l3 = Layout::from_size_align(8, 8).unwrap();
+
+        let p1 = bump.alloc(l1);
+        assert!(!p1.is_null());
+        assert_eq!((p1 as usize) % 1, 0);
+
+        let p2 = bump.alloc(l2);
+        assert!(!p2.is_null());
+        assert_eq!(
+            (p2 as usize) % 16,
+            0,
+            "16-byte aligned alloc returned misaligned pointer: {:p}",
+            p2
+        );
+
+        let p3 = bump.alloc(l3);
+        assert!(!p3.is_null());
+        assert_eq!((p3 as usize) % 8, 0);
+
+        // no overlap
+        assert!(p2 as usize >= p1 as usize + 7);
+        assert!(p3 as usize >= p2 as usize + 16);
+    }
+}
