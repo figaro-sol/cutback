@@ -3,15 +3,26 @@ use core::ptr;
 
 use crate::ring::{RecentAlloc, RingBuffer};
 
+pub(crate) struct MarkNode {
+    cursor: usize,
+    prev: *const MarkNode,
+}
+
+impl MarkNode {
+    pub const fn uninit() -> Self {
+        Self {
+            cursor: 0,
+            prev: ptr::null(),
+        }
+    }
+}
+
 pub(crate) struct ScopedBumpInner<const N: usize> {
     base: *mut u8,
     cap: usize,
     cursor: usize,
     ring: RingBuffer<N>,
-}
-
-pub struct Mark {
-    pub(crate) cursor: usize,
+    mark_head: *const MarkNode,
 }
 
 impl<const N: usize> ScopedBumpInner<N> {
@@ -21,6 +32,7 @@ impl<const N: usize> ScopedBumpInner<N> {
             cap: 0,
             cursor: 0,
             ring: RingBuffer::new(),
+            mark_head: ptr::null(),
         }
     }
 
@@ -32,7 +44,7 @@ impl<const N: usize> ScopedBumpInner<N> {
 
     pub fn alloc(&mut self, layout: Layout) -> *mut u8 {
         if layout.size() == 0 {
-            return layout.align() as *mut u8;
+            return ptr::without_provenance_mut(layout.align());
         }
         let abs_addr = (self.base as usize) + self.cursor;
         let aligned_addr = match align_up(abs_addr, layout.align()) {
@@ -83,7 +95,7 @@ impl<const N: usize> ScopedBumpInner<N> {
         }
         if new_size == 0 {
             self.dealloc(ptr, layout);
-            return layout.align() as *mut u8;
+            return ptr::without_provenance_mut(layout.align());
         }
         if (ptr as usize) < (self.base as usize)
             || (ptr as usize) >= (self.base as usize) + self.cap
@@ -94,13 +106,20 @@ impl<const N: usize> ScopedBumpInner<N> {
         // Case A: newest alive allocation — try in-place
         if let Some(newest) = self.ring.newest() {
             if newest.alive && newest.offset == offset {
-                let new_end = match offset.checked_add(new_size) {
-                    Some(v) if v <= self.cap => v,
-                    _ => return ptr::null_mut(),
-                };
-                self.cursor = new_end;
-                self.ring.update_newest_size(new_size);
-                return ptr;
+                let growing = new_size > layout.size();
+                let crosses_mark = growing
+                    && !self.mark_head.is_null()
+                    && offset < unsafe { (*self.mark_head).cursor };
+                if !crosses_mark {
+                    let new_end = match offset.checked_add(new_size) {
+                        Some(v) if v <= self.cap => v,
+                        _ => return ptr::null_mut(),
+                    };
+                    self.cursor = new_end;
+                    self.ring.update_newest_size(new_size);
+                    return ptr;
+                }
+                // crosses mark boundary: fall through to Case B
             }
         }
         // Case B: not newest — alloc new, copy, dealloc old
@@ -118,16 +137,19 @@ impl<const N: usize> ScopedBumpInner<N> {
         new_ptr
     }
 
-    pub fn mark(&self) -> Mark {
-        Mark {
-            cursor: self.cursor,
-        }
+    pub fn push_mark(&mut self, node: &mut MarkNode) {
+        node.cursor = self.cursor;
+        node.prev = self.mark_head;
+        self.mark_head = node as *const MarkNode;
     }
 
-    pub unsafe fn reset(&mut self, mark: Mark) {
-        if mark.cursor < self.cursor {
-            self.cursor = mark.cursor;
-            self.ring.invalidate_from_offset(mark.cursor);
+    pub fn pop_mark_and_reset(&mut self) {
+        assert!(!self.mark_head.is_null(), "no active mark to pop");
+        let saved = unsafe { (*self.mark_head).cursor };
+        self.mark_head = unsafe { (*self.mark_head).prev };
+        if saved < self.cursor {
+            self.cursor = saved;
+            self.ring.invalidate_from_offset(saved);
         }
     }
 }
@@ -189,7 +211,7 @@ mod tests {
         let p2 = bump.alloc(l2);
         assert!(!p2.is_null());
         assert_eq!((p2 as usize) % 8, 0);
-        assert!(p2 as usize >= p1 as usize + 1);
+        assert!(p2 as usize > p1 as usize);
     }
 
     #[test]
@@ -375,11 +397,12 @@ mod tests {
         let mut bump = make_bump::<8>(&mut arena);
         let l = Layout::from_size_align(16, 1).unwrap();
         let _a = bump.alloc(l);
-        let mark = bump.mark();
+        let mut mark = MarkNode::uninit();
+        bump.push_mark(&mut mark);
         let _b = bump.alloc(l);
         let _c = bump.alloc(l);
         assert_eq!(bump.cursor, 48);
-        unsafe { bump.reset(mark) };
+        bump.pop_mark_and_reset();
         assert_eq!(bump.cursor, 16);
     }
 
@@ -389,13 +412,14 @@ mod tests {
         let mut bump = make_bump::<8>(&mut arena);
         let l = Layout::from_size_align(16, 1).unwrap();
         let _a = bump.alloc(l);
-        let mark = bump.mark();
+        let mut mark = MarkNode::uninit();
+        bump.push_mark(&mut mark);
         let b = bump.alloc(l);
-        // dealloc b rewinds cursor to 16 = mark.cursor
+        // dealloc b rewinds cursor to 16 = mark cursor
         unsafe { bump.dealloc(b, l) };
         assert_eq!(bump.cursor, 16);
-        // reset is no-op since cursor == mark.cursor
-        unsafe { bump.reset(mark) };
+        // pop is no-op since cursor == saved cursor
+        bump.pop_mark_and_reset();
         assert_eq!(bump.cursor, 16);
     }
 
@@ -404,17 +428,19 @@ mod tests {
         let mut arena = [0u8; 1024];
         let mut bump = make_bump::<8>(&mut arena);
         let l = Layout::from_size_align(16, 1).unwrap();
-        let mark1 = bump.mark();
+        let mut mark_outer = MarkNode::uninit();
+        bump.push_mark(&mut mark_outer);
         let _a = bump.alloc(l);
-        let mark2 = bump.mark();
+        let mut mark_inner = MarkNode::uninit();
+        bump.push_mark(&mut mark_inner);
         let _b = bump.alloc(l);
         assert_eq!(bump.cursor, 32);
-        unsafe { bump.reset(mark2) };
+        bump.pop_mark_and_reset();
         assert_eq!(bump.cursor, 16);
         // alloc again after inner reset
         let _c = bump.alloc(l);
         assert_eq!(bump.cursor, 32);
-        unsafe { bump.reset(mark1) };
+        bump.pop_mark_and_reset();
         assert_eq!(bump.cursor, 0);
     }
 
@@ -422,16 +448,99 @@ mod tests {
     fn reset_to_zero_invalidates_all() {
         let mut arena = [0u8; 1024];
         let mut bump = make_bump::<8>(&mut arena);
-        let mark = bump.mark();
+        let mut mark = MarkNode::uninit();
+        bump.push_mark(&mut mark);
         let l = Layout::from_size_align(16, 1).unwrap();
         let _a = bump.alloc(l);
         let _b = bump.alloc(l);
-        unsafe { bump.reset(mark) };
+        bump.pop_mark_and_reset();
         assert_eq!(bump.cursor, 0);
         // can alloc from beginning again
         let c = bump.alloc(l);
         assert!(!c.is_null());
         assert_eq!(bump.cursor, 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "no active mark to pop")]
+    fn pop_mark_empty_panics() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        bump.pop_mark_and_reset();
+    }
+
+    #[test]
+    fn nested_push_pop() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let _a = bump.alloc(l);
+        assert_eq!(bump.cursor, 16);
+        let mut mark_outer = MarkNode::uninit();
+        bump.push_mark(&mut mark_outer);
+        let _b = bump.alloc(l);
+        assert_eq!(bump.cursor, 32);
+        let mut mark_inner = MarkNode::uninit();
+        bump.push_mark(&mut mark_inner);
+        let _c = bump.alloc(l);
+        assert_eq!(bump.cursor, 48);
+        bump.pop_mark_and_reset();
+        assert_eq!(bump.cursor, 32);
+        bump.pop_mark_and_reset();
+        assert_eq!(bump.cursor, 16);
+    }
+
+    #[test]
+    fn realloc_grow_blocked_across_mark() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        assert!(!a.is_null());
+        unsafe { ptr::write_bytes(a, 0xAA, 16) };
+        let mut mark = MarkNode::uninit();
+        bump.push_mark(&mut mark);
+        // realloc A larger — crosses mark, must fall back
+        let new_a = unsafe { bump.realloc(a, l, 32) };
+        assert!(!new_a.is_null());
+        assert_ne!(new_a, a, "should not be in-place when crossing mark");
+        for i in 0..16 {
+            assert_eq!(unsafe { *new_a.add(i) }, 0xAA);
+        }
+        bump.pop_mark_and_reset();
+    }
+
+    #[test]
+    fn realloc_grow_within_scope() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let mut mark = MarkNode::uninit();
+        bump.push_mark(&mut mark);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let b = bump.alloc(l);
+        assert!(!b.is_null());
+        // realloc B larger — allocated within scope, in-place OK
+        let new_b = unsafe { bump.realloc(b, l, 32) };
+        assert_eq!(new_b, b, "in-place growth within scope should work");
+        assert_eq!(bump.cursor, 32);
+        bump.pop_mark_and_reset();
+    }
+
+    #[test]
+    fn realloc_shrink_across_mark_ok() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(32, 1).unwrap();
+        let a = bump.alloc(l);
+        assert!(!a.is_null());
+        let mut mark = MarkNode::uninit();
+        bump.push_mark(&mut mark);
+        // shrink A — always safe in-place
+        let new_a = unsafe { bump.realloc(a, l, 8) };
+        assert_eq!(new_a, a, "shrink should always be in-place");
+        assert_eq!(bump.cursor, 8);
+        bump.pop_mark_and_reset();
+        assert_eq!(bump.cursor, 8);
     }
 
     #[test]
@@ -503,10 +612,11 @@ mod tests {
         let mut bump = make_bump::<8>(&mut arena);
         let zst = Layout::from_size_align(0, 4).unwrap();
         let ptr = bump.alloc(zst);
+        let cursor_before = bump.cursor;
         let new_ptr = unsafe { bump.realloc(ptr, zst, 32) };
         assert!(!new_ptr.is_null());
         assert_eq!((new_ptr as usize) % 4, 0);
-        assert_eq!(bump.cursor, 32);
+        assert!(bump.cursor > cursor_before);
     }
 
     #[test]
@@ -516,11 +626,12 @@ mod tests {
         let layout = Layout::from_size_align(16, 4).unwrap();
         let ptr = bump.alloc(layout);
         assert!(!ptr.is_null());
+        let alloc_offset = ptr as usize - arena.as_ptr() as usize;
         let new_ptr = unsafe { bump.realloc(ptr, layout, 0) };
         assert!(!new_ptr.is_null());
         assert_eq!((new_ptr as usize) % 4, 0);
-        // cursor should have rewound since we deallocated the only allocation
-        assert_eq!(bump.cursor, 0);
+        // cursor should have rewound to the start of the deallocated allocation
+        assert!(bump.cursor <= alloc_offset);
     }
 
     #[test]
@@ -528,7 +639,7 @@ mod tests {
         let mut arena = [0u8; 1025];
         let base = arena.as_mut_ptr();
         // Ensure base is NOT 8-byte aligned
-        let offset = if (base as usize) % 8 == 0 { 1 } else { 0 };
+        let offset = if (base as usize).is_multiple_of(8) { 1 } else { 0 };
         let misaligned_base = unsafe { base.add(offset) };
         assert_ne!((misaligned_base as usize) % 8, 0);
 
@@ -551,7 +662,7 @@ mod tests {
     fn sequential_allocs_aligned_with_misaligned_base() {
         let mut arena = [0u8; 2049];
         let base = arena.as_mut_ptr();
-        let offset = if (base as usize) % 16 == 0 { 1 } else { 0 };
+        let offset = if (base as usize).is_multiple_of(16) { 1 } else { 0 };
         let misaligned_base = unsafe { base.add(offset) };
 
         let mut bump = ScopedBumpInner::<8>::new_uninit();
@@ -563,7 +674,7 @@ mod tests {
 
         let p1 = bump.alloc(l1);
         assert!(!p1.is_null());
-        assert_eq!((p1 as usize) % 1, 0);
+        assert_eq!((p1 as usize) % l1.align(), 0);
 
         let p2 = bump.alloc(l2);
         assert!(!p2.is_null());

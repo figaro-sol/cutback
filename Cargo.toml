@@ -2,6 +2,11 @@
 name = "cutback"
 version = "0.1.0"
 edition = "2021"
+description = "A no_std bump allocator with LIFO dealloc rewind and scoped mark/reset"
+license = "MIT"
+repository = "https://github.com/samschetterer/cutback"
+keywords = ["allocator", "bump", "no_std", "solana"]
+categories = ["memory-management", "no-std"]
 
 [dependencies]
 

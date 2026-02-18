@@ -1,5 +1,10 @@
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
-use cutback::ScopedBump;
+use crate::bump::MarkNode;
+use crate::ScopedBump;
 use proptest::prelude::*;
 
 const ARENA_SIZE: usize = 2048;
@@ -10,8 +15,8 @@ enum Op {
     Alloc { size: usize, align_pow2: u8 },
     Dealloc { idx: usize },
     Realloc { idx: usize, new_size: usize },
-    Mark,
-    Reset { mark_idx: usize },
+    EnterScope,
+    ExitScope,
 }
 
 #[derive(Debug)]
@@ -28,8 +33,8 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         4 => (0usize..=256, 0u8..=6).prop_map(|(size, align_pow2)| Op::Alloc { size, align_pow2 }),
         3 => (0usize..64).prop_map(|idx| Op::Dealloc { idx }),
         2 => (0usize..64, 0usize..=512).prop_map(|(idx, new_size)| Op::Realloc { idx, new_size }),
-        1 => Just(Op::Mark),
-        1 => (0usize..16).prop_map(|mark_idx| Op::Reset { mark_idx }),
+        1 => Just(Op::EnterScope),
+        1 => Just(Op::ExitScope),
     ]
 }
 
@@ -47,7 +52,6 @@ fn check_invariants(allocs: &[ModelAlloc], arena_base: usize, arena_size: usize)
             "alloc exceeds arena"
         );
         assert_eq!(ptr % a.layout.align(), 0, "misaligned allocation");
-        // verify fill byte intact
         for i in 0..a.layout.size() {
             let byte = unsafe { *a.ptr.add(i) };
             assert_eq!(
@@ -57,7 +61,7 @@ fn check_invariants(allocs: &[ModelAlloc], arena_base: usize, arena_size: usize)
             );
         }
     }
-    // check no overlaps (skip ZSTs — they have no address range)
+    // check no overlaps (skip ZSTs)
     let sized_alive: Vec<&ModelAlloc> = alive.iter().filter(|a| a.layout.size() > 0).copied().collect();
     for i in 0..sized_alive.len() {
         for j in (i + 1)..sized_alive.len() {
@@ -88,9 +92,11 @@ proptest! {
         unsafe { alloc.init(arena.as_mut_ptr(), arena.len()) };
 
         let mut allocs: Vec<ModelAlloc> = Vec::new();
-        let mut marks: Vec<(cutback::Mark, u64)> = Vec::new();
+        let mut scope_stack: Vec<u64> = Vec::new();
         let mut fill_counter: u8 = 1;
         let mut generation: u64 = 0;
+        let mut mark_nodes: [MarkNode; 8] = core::array::from_fn(|_| MarkNode::uninit());
+        let mut scope_depth: usize = 0;
 
         for op in ops {
             match op {
@@ -141,7 +147,6 @@ proptest! {
                     }
                     let target = alive_indices[idx % alive_indices.len()];
                     let a = &allocs[target];
-                    // verify data before dealloc
                     for i in 0..a.layout.size() {
                         let byte = unsafe { *a.ptr.add(i) };
                         assert_eq!(byte, a.fill_byte);
@@ -163,7 +168,6 @@ proptest! {
                     let a = &allocs[target];
                     let old_size = a.layout.size();
                     let old_fill = a.fill_byte;
-                    // verify old data
                     for i in 0..old_size {
                         let byte = unsafe { *a.ptr.add(i) };
                         assert_eq!(byte, old_fill);
@@ -177,7 +181,6 @@ proptest! {
                     }
                     let new_ptr = unsafe { alloc.realloc(a.ptr, a.layout, new_size) };
                     if !new_ptr.is_null() {
-                        // verify preserved bytes
                         let preserved = old_size.min(new_size);
                         for i in 0..preserved {
                             let byte = unsafe { *new_ptr.add(i) };
@@ -185,7 +188,6 @@ proptest! {
                         }
                         let new_layout =
                             Layout::from_size_align(new_size, a.layout.align()).unwrap();
-                        // fill entire new region with new fill byte
                         unsafe { core::ptr::write_bytes(new_ptr, fill_counter, new_size) };
                         generation += 1;
                         allocs[target] = ModelAlloc {
@@ -200,19 +202,22 @@ proptest! {
                             fill_counter = 1;
                         }
                     }
-                    // if null, old alloc still valid (unchanged)
                 }
-                Op::Mark => {
-                    marks.push((alloc.mark(), generation));
-                }
-                Op::Reset { mark_idx } => {
-                    if marks.is_empty() {
+                Op::EnterScope => {
+                    if scope_depth >= 8 {
                         continue;
                     }
-                    let mi = mark_idx % marks.len();
-                    let (mark, saved_gen) = marks.remove(mi);
-                    marks.truncate(mi);
-                    unsafe { alloc.reset(mark) };
+                    unsafe { alloc.push_mark(&mut mark_nodes[scope_depth]) };
+                    scope_stack.push(generation);
+                    scope_depth += 1;
+                }
+                Op::ExitScope => {
+                    if scope_stack.is_empty() {
+                        continue;
+                    }
+                    unsafe { alloc.pop_mark_and_reset() };
+                    scope_depth -= 1;
+                    let saved_gen = scope_stack.pop().unwrap();
                     for a in allocs.iter_mut() {
                         if a.generation > saved_gen {
                             a.alive = false;
@@ -222,5 +227,16 @@ proptest! {
             }
             check_invariants(&allocs, arena_base, ARENA_SIZE);
         }
+
+        // cleanup: pop all remaining scopes
+        while let Some(saved_gen) = scope_stack.pop() {
+            unsafe { alloc.pop_mark_and_reset() };
+            for a in allocs.iter_mut() {
+                if a.generation > saved_gen {
+                    a.alive = false;
+                }
+            }
+        }
+        check_invariants(&allocs, arena_base, ARENA_SIZE);
     }
 }

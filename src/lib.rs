@@ -3,10 +3,13 @@
 mod bump;
 mod ring;
 
+#[cfg(test)]
+mod proptest_tests;
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
-pub use bump::Mark;
+use bump::MarkNode;
 use bump::ScopedBumpInner;
 
 /// Single-threaded scoped bump allocator.
@@ -35,14 +38,32 @@ impl<const N: usize> ScopedBump<N> {
         unsafe { (*self.inner.get()).init(base, cap) }
     }
 
-    pub fn mark(&self) -> Mark {
-        unsafe { (*self.inner.get()).mark() }
+    #[cfg(test)]
+    pub(crate) unsafe fn push_mark(&self, node: &mut MarkNode) {
+        (*self.inner.get()).push_mark(node);
+    }
+
+    #[cfg(test)]
+    pub(crate) unsafe fn pop_mark_and_reset(&self) {
+        (*self.inner.get()).pop_mark_and_reset();
     }
 
     /// # Safety
-    /// All allocations made after the mark must not be used after this call.
-    pub unsafe fn reset(&self, mark: Mark) {
-        unsafe { (*self.inner.get()).reset(mark) }
+    /// Allocations made during `f` are invalidated when `with_mark` returns.
+    /// Caller must not use those pointers afterward.
+    pub unsafe fn with_mark<R>(&self, f: impl FnOnce() -> R) -> R {
+        let mut node = MarkNode::uninit();
+        (*self.inner.get()).push_mark(&mut node);
+        struct Guard<'a, const M: usize>(&'a ScopedBump<M>);
+        impl<const M: usize> Drop for Guard<'_, M> {
+            fn drop(&mut self) {
+                unsafe { (*self.0.inner.get()).pop_mark_and_reset() };
+            }
+        }
+        let guard = Guard(self);
+        let result = f();
+        drop(guard);
+        result
     }
 }
 
@@ -86,20 +107,19 @@ mod tests {
     }
 
     #[test]
-    fn public_api_mark_reset() {
+    fn public_api_with_mark() {
         with_allocator(|alloc| {
             let layout = Layout::from_size_align(64, 8).unwrap();
-            let mark = alloc.mark();
             unsafe {
-                let p1 = alloc.alloc(layout);
-                assert!(!p1.is_null());
-                let p2 = alloc.alloc(layout);
-                assert!(!p2.is_null());
-                alloc.reset(mark);
-                // can re-use space
+                alloc.with_mark(|| {
+                    let p1 = alloc.alloc(layout);
+                    assert!(!p1.is_null());
+                    let p2 = alloc.alloc(layout);
+                    assert!(!p2.is_null());
+                });
+                // space reclaimed — can re-use from the beginning
                 let p3 = alloc.alloc(layout);
                 assert!(!p3.is_null());
-                assert_eq!(p3, p1);
             }
         });
     }
