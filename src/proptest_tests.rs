@@ -1,10 +1,10 @@
 extern crate alloc;
 
+use crate::bump::MarkNode;
+use crate::ScopedBump;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
-use crate::bump::MarkNode;
-use crate::ScopedBump;
 use proptest::prelude::*;
 
 const ARENA_SIZE: usize = 2048;
@@ -62,7 +62,11 @@ fn check_invariants(allocs: &[ModelAlloc], arena_base: usize, arena_size: usize)
         }
     }
     // check no overlaps (skip ZSTs)
-    let sized_alive: Vec<&ModelAlloc> = alive.iter().filter(|a| a.layout.size() > 0).copied().collect();
+    let sized_alive: Vec<&ModelAlloc> = alive
+        .iter()
+        .filter(|a| a.layout.size() > 0)
+        .copied()
+        .collect();
     for i in 0..sized_alive.len() {
         for j in (i + 1)..sized_alive.len() {
             let a_start = sized_alive[i].ptr as usize;

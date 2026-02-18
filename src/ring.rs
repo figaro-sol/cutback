@@ -181,10 +181,10 @@ mod tests {
     #[test]
     fn suffix_rewind_partial() {
         let mut ring = RingBuffer::<4>::new();
-        ring.push(alive(0, 8));   // oldest
+        ring.push(alive(0, 8)); // oldest
         ring.push(alive(8, 8));
-        ring.push(alive(16, 8));  // newest
-        // kill newest only
+        ring.push(alive(16, 8)); // newest
+                                 // kill newest only
         let idx = ring.find_by_offset(16).unwrap();
         ring.mark_dead(idx);
         assert_eq!(ring.suffix_rewind_cursor(), Some(16));

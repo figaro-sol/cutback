@@ -51,60 +51,12 @@ alloc D            cursor=128  <- reuses B/C's space
 
 ```
 realloc(ptr, old_layout, new_size):
-  Is ptr the newest alive allocation?
-    No  -> fallback: alloc new, copy, dealloc old
-    Yes -> Is this a growth that crosses a mark boundary?
-      Yes -> fallback (prevents corruption on scope exit)
-      No  -> extend in-place, update cursor
+  Is a mark scope active?
+    Yes -> fallback: alloc new, copy, dealloc old
+    No  -> Is ptr the newest alive allocation?
+      No  -> fallback
+      Yes -> extend in-place, update cursor
 ```
-
-<details>
-<summary>Mermaid diagrams</summary>
-
-#### Allocation + LIFO dealloc
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant B as Bump
-    U->>B: alloc(64)
-    B-->>U: ptr A, cursor=64
-    U->>B: alloc(64)
-    B-->>U: ptr B, cursor=128
-    U->>B: dealloc(B)
-    B-->>U: cursor=64 (rewound)
-```
-
-#### Scoped mark/reset
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant B as Bump
-    U->>B: alloc A
-    Note over B: cursor=64
-    U->>B: with_mark(|| { ... })
-    B->>B: push_mark(cursor=64)
-    U->>B: alloc B
-    Note over B: cursor=128
-    U->>B: alloc C
-    Note over B: cursor=192
-    B->>B: pop_mark_and_reset
-    Note over B: cursor=64
-```
-
-#### Realloc decision
-
-```mermaid
-flowchart TD
-    A[realloc ptr, new_size] --> B{newest alive?}
-    B -- No --> F[alloc new + copy + dealloc old]
-    B -- Yes --> C{growing across mark?}
-    C -- Yes --> F
-    C -- No --> D[extend in-place]
-```
-
-</details>
 
 ## Usage
 
@@ -195,7 +147,7 @@ fn main() {
 
 **Mark depth:** Unlimited nesting (each scope uses one pointer on the call stack).
 
-**Realloc safety:** When a mark scope is active, in-place growth of pre-scope allocations is blocked (falls back to alloc+copy+dealloc). This prevents cursor rewind on scope exit from corrupting grown allocations.
+**Ring freeze during marks:** While any mark scope is active, the ring buffer is frozen -- allocations aren't tracked, deallocs don't rewind, and realloc always falls back to alloc+copy+dealloc. This keeps the ring clean for pre-mark allocations after the scope ends, where LIFO rewind matters most. Pre-mark frees that were deferred during the scope are recovered on the outermost scope exit.
 
 **ZSTs:** Return a dangling aligned pointer. Don't touch the arena or ring buffer.
 
@@ -210,7 +162,7 @@ fn main() {
 
 ## Testing
 
-~55 unit tests covering the allocator and ring buffer, plus property-based tests (proptest) that throw random sequences of alloc/dealloc/realloc/enter-scope/exit-scope at both the real allocator and a reference model. Checked for overlapping allocations, out-of-bounds, data corruption, alignment errors.
+~57 unit tests covering the allocator and ring buffer, plus property-based tests (proptest) that throw random sequences of alloc/dealloc/realloc/enter-scope/exit-scope at both the real allocator and a reference model. Checked for overlapping allocations, out-of-bounds, data corruption, alignment errors.
 
 ```
 cargo test

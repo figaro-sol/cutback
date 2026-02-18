@@ -1,20 +1,26 @@
 use core::alloc::Layout;
 use core::ptr;
+use core::ptr::NonNull;
 
 use crate::ring::{RecentAlloc, RingBuffer};
 
 pub(crate) struct MarkNode {
     cursor: usize,
-    prev: *const MarkNode,
+    prev: Option<NonNull<MarkNode>>,
 }
 
 impl MarkNode {
     pub const fn uninit() -> Self {
         Self {
             cursor: 0,
-            prev: ptr::null(),
+            prev: None,
         }
     }
+}
+
+enum MarkState {
+    Unmarked,
+    Marked { head: NonNull<MarkNode> },
 }
 
 pub(crate) struct ScopedBumpInner<const N: usize> {
@@ -22,7 +28,7 @@ pub(crate) struct ScopedBumpInner<const N: usize> {
     cap: usize,
     cursor: usize,
     ring: RingBuffer<N>,
-    mark_head: *const MarkNode,
+    mark_state: MarkState,
 }
 
 impl<const N: usize> ScopedBumpInner<N> {
@@ -32,7 +38,7 @@ impl<const N: usize> ScopedBumpInner<N> {
             cap: 0,
             cursor: 0,
             ring: RingBuffer::new(),
-            mark_head: ptr::null(),
+            mark_state: MarkState::Unmarked,
         }
     }
 
@@ -40,6 +46,10 @@ impl<const N: usize> ScopedBumpInner<N> {
         assert!(self.base.is_null(), "init called twice");
         self.base = base;
         self.cap = cap;
+    }
+
+    fn is_marked(&self) -> bool {
+        matches!(self.mark_state, MarkState::Marked { .. })
     }
 
     pub fn alloc(&mut self, layout: Layout) -> *mut u8 {
@@ -56,11 +66,13 @@ impl<const N: usize> ScopedBumpInner<N> {
             Some(v) if v <= self.cap => v,
             _ => return ptr::null_mut(),
         };
-        self.ring.push(RecentAlloc {
-            offset: aligned,
-            size: layout.size(),
-            alive: true,
-        });
+        if !self.is_marked() {
+            self.ring.push(RecentAlloc {
+                offset: aligned,
+                size: layout.size(),
+                alive: true,
+            });
+        }
         self.cursor = end;
         unsafe { self.base.add(aligned) }
     }
@@ -80,8 +92,10 @@ impl<const N: usize> ScopedBumpInner<N> {
             None => return,
         };
         self.ring.mark_dead(idx);
-        if let Some(rewind_to) = self.ring.suffix_rewind_cursor() {
-            self.cursor = rewind_to;
+        if !self.is_marked() {
+            if let Some(rewind_to) = self.ring.suffix_rewind_cursor() {
+                self.cursor = rewind_to;
+            }
         }
     }
 
@@ -103,14 +117,11 @@ impl<const N: usize> ScopedBumpInner<N> {
             return ptr::null_mut();
         }
         let offset = ptr as usize - self.base as usize;
-        // Case A: newest alive allocation — try in-place
-        if let Some(newest) = self.ring.newest() {
-            if newest.alive && newest.offset == offset {
-                let growing = new_size > layout.size();
-                let crosses_mark = growing
-                    && !self.mark_head.is_null()
-                    && offset < unsafe { (*self.mark_head).cursor };
-                if !crosses_mark {
+        // Case A: newest alive allocation — try in-place (only when unmarked;
+        // ring is frozen during marks so newest() would be a stale pre-mark entry)
+        if !self.is_marked() {
+            if let Some(newest) = self.ring.newest() {
+                if newest.alive && newest.offset == offset {
                     let new_end = match offset.checked_add(new_size) {
                         Some(v) if v <= self.cap => v,
                         _ => return ptr::null_mut(),
@@ -119,7 +130,6 @@ impl<const N: usize> ScopedBumpInner<N> {
                     self.ring.update_newest_size(new_size);
                     return ptr;
                 }
-                // crosses mark boundary: fall through to Case B
             }
         }
         // Case B: not newest — alloc new, copy, dealloc old
@@ -139,17 +149,39 @@ impl<const N: usize> ScopedBumpInner<N> {
 
     pub fn push_mark(&mut self, node: &mut MarkNode) {
         node.cursor = self.cursor;
-        node.prev = self.mark_head;
-        self.mark_head = node as *const MarkNode;
+        node.prev = match self.mark_state {
+            MarkState::Marked { head } => Some(head),
+            MarkState::Unmarked => None,
+        };
+        self.mark_state = MarkState::Marked {
+            head: NonNull::from(&mut *node),
+        };
     }
 
     pub fn pop_mark_and_reset(&mut self) {
-        assert!(!self.mark_head.is_null(), "no active mark to pop");
-        let saved = unsafe { (*self.mark_head).cursor };
-        self.mark_head = unsafe { (*self.mark_head).prev };
+        let head = match self.mark_state {
+            MarkState::Marked { head } => head,
+            MarkState::Unmarked => panic!("no active mark to pop"),
+        };
+        let node = unsafe { head.as_ref() };
+        let saved = node.cursor;
+        self.mark_state = match node.prev {
+            Some(prev) => MarkState::Marked { head: prev },
+            None => MarkState::Unmarked,
+        };
         if saved < self.cursor {
             self.cursor = saved;
             self.ring.invalidate_from_offset(saved);
+        }
+        // On transition to Unmarked, recover space from pre-mark frees
+        // NOTE: For deep/long-lived nested marks needing full ring semantics,
+        // a per-mark ring snapshot approach could restore the ring to its exact
+        // state at mark time. Current approach (freeze ring during marks) is
+        // simpler and sufficient for typical short-lived tactical mark usage.
+        if !self.is_marked() {
+            if let Some(rewind_to) = self.ring.suffix_rewind_cursor() {
+                self.cursor = rewind_to;
+            }
         }
     }
 }
@@ -415,10 +447,10 @@ mod tests {
         let mut mark = MarkNode::uninit();
         bump.push_mark(&mut mark);
         let b = bump.alloc(l);
-        // dealloc b rewinds cursor to 16 = mark cursor
+        // dealloc b: ring is frozen so b isn't tracked — dealloc is a no-op
         unsafe { bump.dealloc(b, l) };
-        assert_eq!(bump.cursor, 16);
-        // pop is no-op since cursor == saved cursor
+        assert_eq!(bump.cursor, 32);
+        // pop rewinds cursor to mark's saved cursor (16)
         bump.pop_mark_and_reset();
         assert_eq!(bump.cursor, 16);
     }
@@ -500,10 +532,10 @@ mod tests {
         unsafe { ptr::write_bytes(a, 0xAA, 16) };
         let mut mark = MarkNode::uninit();
         bump.push_mark(&mut mark);
-        // realloc A larger — crosses mark, must fall back
+        // realloc A larger — ring frozen during mark, must fall back
         let new_a = unsafe { bump.realloc(a, l, 32) };
         assert!(!new_a.is_null());
-        assert_ne!(new_a, a, "should not be in-place when crossing mark");
+        assert_ne!(new_a, a, "should not be in-place during mark");
         for i in 0..16 {
             assert_eq!(unsafe { *new_a.add(i) }, 0xAA);
         }
@@ -519,10 +551,14 @@ mod tests {
         let l = Layout::from_size_align(16, 1).unwrap();
         let b = bump.alloc(l);
         assert!(!b.is_null());
-        // realloc B larger — allocated within scope, in-place OK
+        unsafe { ptr::write_bytes(b, 0xAA, 16) };
+        // realloc B larger — ring frozen, in-place skipped, uses fallback
         let new_b = unsafe { bump.realloc(b, l, 32) };
-        assert_eq!(new_b, b, "in-place growth within scope should work");
-        assert_eq!(bump.cursor, 32);
+        assert!(!new_b.is_null());
+        assert_ne!(new_b, b, "should fall back when ring is frozen");
+        for i in 0..16 {
+            assert_eq!(unsafe { *new_b.add(i) }, 0xAA);
+        }
         bump.pop_mark_and_reset();
     }
 
@@ -533,14 +569,20 @@ mod tests {
         let l = Layout::from_size_align(32, 1).unwrap();
         let a = bump.alloc(l);
         assert!(!a.is_null());
+        unsafe { ptr::write_bytes(a, 0xBB, 32) };
         let mut mark = MarkNode::uninit();
         bump.push_mark(&mut mark);
-        // shrink A — always safe in-place
+        // shrink A — ring frozen, in-place skipped, uses fallback
         let new_a = unsafe { bump.realloc(a, l, 8) };
-        assert_eq!(new_a, a, "shrink should always be in-place");
-        assert_eq!(bump.cursor, 8);
+        assert!(!new_a.is_null());
+        assert_ne!(new_a, a, "should fall back when ring is frozen");
+        for i in 0..8 {
+            assert_eq!(unsafe { *new_a.add(i) }, 0xBB);
+        }
         bump.pop_mark_and_reset();
-        assert_eq!(bump.cursor, 8);
+        // pop rewinds to mark cursor (32), then suffix_rewind recovers
+        // the dead pre-mark alloc (a at offset 0), cursor goes to 0
+        assert_eq!(bump.cursor, 0);
     }
 
     #[test]
@@ -639,7 +681,11 @@ mod tests {
         let mut arena = [0u8; 1025];
         let base = arena.as_mut_ptr();
         // Ensure base is NOT 8-byte aligned
-        let offset = if (base as usize).is_multiple_of(8) { 1 } else { 0 };
+        let offset = if (base as usize).is_multiple_of(8) {
+            1
+        } else {
+            0
+        };
         let misaligned_base = unsafe { base.add(offset) };
         assert_ne!((misaligned_base as usize) % 8, 0);
 
@@ -662,7 +708,11 @@ mod tests {
     fn sequential_allocs_aligned_with_misaligned_base() {
         let mut arena = [0u8; 2049];
         let base = arena.as_mut_ptr();
-        let offset = if (base as usize).is_multiple_of(16) { 1 } else { 0 };
+        let offset = if (base as usize).is_multiple_of(16) {
+            1
+        } else {
+            0
+        };
         let misaligned_base = unsafe { base.add(offset) };
 
         let mut bump = ScopedBumpInner::<8>::new_uninit();
@@ -692,5 +742,68 @@ mod tests {
         // no overlap
         assert!(p2 as usize >= p1 as usize + 7);
         assert!(p3 as usize >= p2 as usize + 16);
+    }
+
+    #[test]
+    fn ring_clean_after_mark_scope() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        assert_eq!(bump.cursor, 16);
+        let mut mark = MarkNode::uninit();
+        bump.push_mark(&mut mark);
+        // alloc and dealloc inside mark — ring stays frozen
+        let b = bump.alloc(l);
+        let _c = bump.alloc(l);
+        unsafe { bump.dealloc(b, l) };
+        bump.pop_mark_and_reset();
+        assert_eq!(bump.cursor, 16);
+        // pre-mark LIFO still works: dealloc a rewinds to 0
+        unsafe { bump.dealloc(a, l) };
+        assert_eq!(bump.cursor, 0);
+    }
+
+    #[test]
+    fn pre_mark_frees_recovered_on_pop() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        let b = bump.alloc(l);
+        assert_eq!(bump.cursor, 32);
+        let mut mark = MarkNode::uninit();
+        bump.push_mark(&mut mark);
+        // dealloc pre-mark allocs during mark — marks them dead but no rewind
+        unsafe { bump.dealloc(b, l) };
+        unsafe { bump.dealloc(a, l) };
+        assert_eq!(bump.cursor, 32);
+        // pop transitions to Unmarked, suffix_rewind recovers space
+        bump.pop_mark_and_reset();
+        assert_eq!(bump.cursor, 0);
+    }
+
+    #[test]
+    fn nested_marks_recover_only_on_outermost_pop() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<8>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l);
+        let b = bump.alloc(l);
+        assert_eq!(bump.cursor, 32);
+        let mut mark_outer = MarkNode::uninit();
+        bump.push_mark(&mut mark_outer);
+        let mut mark_inner = MarkNode::uninit();
+        bump.push_mark(&mut mark_inner);
+        // dealloc pre-mark allocs inside inner mark
+        unsafe { bump.dealloc(b, l) };
+        unsafe { bump.dealloc(a, l) };
+        assert_eq!(bump.cursor, 32);
+        // inner pop: still marked (outer), no suffix_rewind
+        bump.pop_mark_and_reset();
+        assert_eq!(bump.cursor, 32);
+        // outer pop: transitions to Unmarked, suffix_rewind recovers
+        bump.pop_mark_and_reset();
+        assert_eq!(bump.cursor, 0);
     }
 }
