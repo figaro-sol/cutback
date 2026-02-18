@@ -6,10 +6,16 @@ mod ring;
 #[cfg(test)]
 mod proptest_tests;
 
+#[cfg(any(test, fuzzing))]
+pub mod test_harness;
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
+#[cfg(not(any(test, fuzzing)))]
 use bump::MarkNode;
+#[cfg(any(test, fuzzing))]
+pub use bump::MarkNode;
 use bump::ScopedBumpInner;
 
 /// Single-threaded scoped bump allocator.
@@ -38,13 +44,13 @@ impl<const N: usize> ScopedBump<N> {
         unsafe { (*self.inner.get()).init(base, cap) }
     }
 
-    #[cfg(test)]
-    pub(crate) unsafe fn push_mark(&self, node: &mut MarkNode) {
+    #[cfg(any(test, fuzzing))]
+    pub unsafe fn push_mark(&self, node: &mut MarkNode) {
         (*self.inner.get()).push_mark(node);
     }
 
-    #[cfg(test)]
-    pub(crate) unsafe fn pop_mark_and_reset(&self) {
+    #[cfg(any(test, fuzzing))]
+    pub unsafe fn pop_mark_and_reset(&self) {
         (*self.inner.get()).pop_mark_and_reset();
     }
 

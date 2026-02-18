@@ -4,7 +4,16 @@ use core::ptr::NonNull;
 
 use crate::ring::{RecentAlloc, RingBuffer};
 
-pub(crate) struct MarkNode {
+#[cfg(fuzzing)]
+extern crate alloc;
+
+#[cfg(fuzzing)]
+struct AllocInfo {
+    size: usize,
+    align: usize,
+}
+
+pub struct MarkNode {
     cursor: usize,
     prev: Option<NonNull<MarkNode>>,
 }
@@ -29,6 +38,8 @@ pub(crate) struct ScopedBumpInner<const N: usize> {
     cursor: usize,
     ring: RingBuffer<N>,
     mark_state: MarkState,
+    #[cfg(fuzzing)]
+    tracker: alloc::collections::BTreeMap<usize, AllocInfo>,
 }
 
 impl<const N: usize> ScopedBumpInner<N> {
@@ -39,6 +50,8 @@ impl<const N: usize> ScopedBumpInner<N> {
             cursor: 0,
             ring: RingBuffer::new(),
             mark_state: MarkState::Unmarked,
+            #[cfg(fuzzing)]
+            tracker: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -74,6 +87,31 @@ impl<const N: usize> ScopedBumpInner<N> {
             });
         }
         self.cursor = end;
+        #[cfg(fuzzing)]
+        {
+            if let Some((&off, info)) = self.tracker.range(..=aligned).next_back() {
+                debug_assert!(
+                    off + info.size <= aligned,
+                    "alloc overlap: existing [{off}..{}) overlaps new [{aligned}..{})",
+                    off + info.size,
+                    aligned + layout.size()
+                );
+            }
+            if let Some((&off, _)) = self.tracker.range(aligned..).next() {
+                debug_assert!(
+                    aligned + layout.size() <= off,
+                    "alloc overlap: new [{aligned}..{}) overlaps existing [{off}..)",
+                    aligned + layout.size()
+                );
+            }
+            self.tracker.insert(
+                aligned,
+                AllocInfo {
+                    size: layout.size(),
+                    align: layout.align(),
+                },
+            );
+        }
         unsafe { self.base.add(aligned) }
     }
 
@@ -87,6 +125,29 @@ impl<const N: usize> ScopedBumpInner<N> {
             return;
         }
         let offset = ptr as usize - self.base as usize;
+        #[cfg(fuzzing)]
+        {
+            match self.tracker.remove(&offset) {
+                Some(info) => {
+                    debug_assert_eq!(
+                        layout.size(),
+                        info.size,
+                        "dealloc size mismatch at offset {offset}: got {}, stored {}",
+                        layout.size(),
+                        info.size
+                    );
+                    debug_assert_eq!(
+                        layout.align(),
+                        info.align,
+                        "dealloc align mismatch at offset {offset}"
+                    );
+                }
+                None => debug_assert!(
+                    false,
+                    "dealloc of untracked offset {offset} (double-free or invalid)"
+                ),
+            }
+        }
         let idx = match self.ring.find_by_offset(offset) {
             Some(i) => i,
             None => return,
@@ -128,6 +189,14 @@ impl<const N: usize> ScopedBumpInner<N> {
                     };
                     self.cursor = new_end;
                     self.ring.update_newest_size(new_size);
+                    #[cfg(fuzzing)]
+                    if let Some(info) = self.tracker.get_mut(&offset) {
+                        debug_assert_eq!(layout.size(), info.size);
+                        debug_assert_eq!(layout.align(), info.align);
+                        info.size = new_size;
+                    } else {
+                        debug_assert!(false, "in-place realloc of untracked offset {offset}");
+                    }
                     return ptr;
                 }
             }
@@ -172,6 +241,14 @@ impl<const N: usize> ScopedBumpInner<N> {
         if saved < self.cursor {
             self.cursor = saved;
             self.ring.invalidate_from_offset(saved);
+            #[cfg(fuzzing)]
+            {
+                let to_remove: alloc::vec::Vec<usize> =
+                    self.tracker.range(saved..).map(|(&k, _)| k).collect();
+                for off in to_remove {
+                    self.tracker.remove(&off);
+                }
+            }
         }
         // On transition to Unmarked, recover space from pre-mark frees
         // NOTE: For deep/long-lived nested marks needing full ring semantics,
@@ -781,6 +858,47 @@ mod tests {
         // pop transitions to Unmarked, suffix_rewind recovers space
         bump.pop_mark_and_reset();
         assert_eq!(bump.cursor, 0);
+    }
+
+    #[test]
+    fn ring_eviction_before_mark_space_leaked() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<2>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l); // offset 0, ring=[A]
+        let b = bump.alloc(l); // offset 16, ring=[A,B]
+        let c = bump.alloc(l); // offset 32, ring=[B,C], A evicted
+        assert_eq!(bump.cursor, 48);
+        let mut mark = MarkNode::uninit();
+        bump.push_mark(&mut mark); // saved=48, ring frozen
+        unsafe { bump.dealloc(a, l) }; // no-op: A evicted from ring
+        assert_eq!(bump.cursor, 48);
+        unsafe { bump.dealloc(b, l) }; // mark_dead but no rewind (marked)
+        unsafe { bump.dealloc(c, l) }; // mark_dead but no rewind (marked)
+        assert_eq!(bump.cursor, 48);
+        bump.pop_mark_and_reset();
+        // B and C (both dead) are suffix-rewound: cursor → 16
+        // A's space [0..16) is permanently leaked (evicted, never recovered)
+        assert_eq!(bump.cursor, 16);
+    }
+
+    #[test]
+    fn ring_eviction_lifo_still_works_for_tracked() {
+        let mut arena = [0u8; 1024];
+        let mut bump = make_bump::<2>(&mut arena);
+        let l = Layout::from_size_align(16, 1).unwrap();
+        let a = bump.alloc(l); // offset 0, ring=[A]
+        let b = bump.alloc(l); // offset 16, ring=[A,B]
+        let c = bump.alloc(l); // offset 32, ring=[B,C], A evicted
+        assert_eq!(bump.cursor, 48);
+        // LIFO dealloc of ring-tracked entries recovers space
+        unsafe { bump.dealloc(c, l) };
+        assert_eq!(bump.cursor, 32);
+        unsafe { bump.dealloc(b, l) };
+        assert_eq!(bump.cursor, 16);
+        // A was evicted — dealloc is a no-op, cursor unchanged
+        unsafe { bump.dealloc(a, l) };
+        assert_eq!(bump.cursor, 16);
     }
 
     #[test]
