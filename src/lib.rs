@@ -2,6 +2,7 @@
 
 mod bump;
 mod ring;
+mod tracker;
 
 #[cfg(test)]
 mod proptest_tests;
@@ -16,6 +17,7 @@ use core::cell::UnsafeCell;
 use bump::MarkNode;
 #[cfg(any(test, fuzzing))]
 pub use bump::MarkNode;
+
 use bump::ScopedBumpInner;
 
 /// Single-threaded scoped bump allocator.
@@ -45,7 +47,7 @@ impl<const N: usize> ScopedBump<N> {
     }
 
     #[cfg(any(test, fuzzing))]
-    pub unsafe fn push_mark(&self, node: &mut MarkNode) {
+    pub unsafe fn push_mark(&self, node: &mut MarkNode<N>) {
         (*self.inner.get()).push_mark(node);
     }
 
@@ -58,7 +60,7 @@ impl<const N: usize> ScopedBump<N> {
     /// Allocations made during `f` are invalidated when `with_mark` returns.
     /// Caller must not use those pointers afterward.
     pub unsafe fn with_mark<R>(&self, f: impl FnOnce() -> R) -> R {
-        let mut node = MarkNode::uninit();
+        let mut node = MarkNode::<N>::uninit();
         (*self.inner.get()).push_mark(&mut node);
         struct Guard<'a, const M: usize>(&'a ScopedBump<M>);
         impl<const M: usize> Drop for Guard<'_, M> {

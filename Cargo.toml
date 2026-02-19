@@ -9,6 +9,7 @@ keywords = ["allocator", "bump", "no_std", "solana"]
 categories = ["memory-management", "no-std"]
 
 [dependencies]
+modular-bitfield = "0.11"
 
 [dev-dependencies]
 proptest = "1"

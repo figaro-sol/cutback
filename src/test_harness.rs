@@ -82,7 +82,7 @@ pub fn run_ops<const N: usize>(
     let mut fill_counter: u8 = 1;
     let mut generation: u64 = 0;
     // Fixed-size mark node pool — EnterScope is silently capped at depth 8.
-    let mut mark_nodes: [MarkNode; 8] = core::array::from_fn(|_| MarkNode::uninit());
+    let mut mark_nodes: [MarkNode<N>; 8] = core::array::from_fn(|_| MarkNode::uninit());
     let mut scope_depth: usize = 0;
 
     for op in ops {
@@ -217,7 +217,6 @@ pub fn run_ops<const N: usize>(
     // cleanup: pop all remaining scopes
     while let Some(saved_gen) = scope_stack.pop() {
         unsafe { alloc.pop_mark_and_reset() };
-        scope_depth -= 1;
         for a in allocs.iter_mut() {
             if a.generation > saved_gen {
                 a.alive = false;
