@@ -51,12 +51,12 @@ alloc D            cursor=128  <- reuses B/C's space
 
 ```
 realloc(ptr, old_layout, new_size):
-  Is a mark scope active?
-    Yes -> fallback: alloc new, copy, dealloc old
-    No  -> Is ptr the newest alive allocation?
-      No  -> fallback
-      Yes -> extend in-place, update cursor
+  Is ptr the newest alive allocation in the current scope's ring?
+    Yes -> extend in-place, update cursor
+    No  -> fallback: alloc new, copy, dealloc old
 ```
+
+The "current scope's ring" is the inner ring during a mark, or the main ring otherwise. No mark-specific branching exists.
 
 ## Usage
 
@@ -147,7 +147,7 @@ fn main() {
 
 **Mark depth:** Unlimited nesting (each scope uses one pointer on the call stack).
 
-**Ring freeze during marks:** While any mark scope is active, the ring buffer is frozen -- allocations aren't tracked, deallocs don't rewind, and realloc always falls back to alloc+copy+dealloc. This keeps the ring clean for pre-mark allocations after the scope ends, where LIFO rewind matters most. Pre-mark frees that were deferred during the scope are recovered on the outermost scope exit.
+**Ring isolation during marks:** Each mark scope gets a fresh ring buffer. Within a scope, LIFO dealloc rewind and in-place realloc work normally. Only cross-scope operations are limited: pre-mark allocations live in the parent's saved ring, so realloc of a pre-mark alloc falls back to alloc+copy+dealloc. Pre-mark frees are deferred and recovered on scope exit.
 
 **ZSTs:** Return a dangling aligned pointer. Don't touch the arena or ring buffer.
 
