@@ -52,10 +52,7 @@ impl AllocTracker {
                     "dealloc align mismatch at offset {offset}"
                 );
             }
-            None => debug_assert!(
-                false,
-                "dealloc of untracked offset {offset} (double-free or invalid)"
-            ),
+            None => panic!("dealloc of untracked offset {offset} (double-free or invalid)"),
         }
     }
 
@@ -71,7 +68,7 @@ impl AllocTracker {
             debug_assert_eq!(align, info.align);
             info.size = new_size;
         } else {
-            debug_assert!(false, "in-place realloc of untracked offset {offset}");
+            panic!("in-place realloc of untracked offset {offset}");
         }
     }
 

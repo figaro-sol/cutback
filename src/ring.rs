@@ -1,14 +1,18 @@
-use modular_bitfield::prelude::*;
-
-#[bitfield(bits = 64)]
-#[derive(Copy, Clone)]
-pub(crate) struct RecentAlloc {
-    pub size: B30,   // bits  0-29: allocation size (max 1 GB)
-    pub offset: B30, // bits 30-59: arena offset   (max 1 GB)
-    #[skip]
-    __: B3, // bits 60-62: padding
-    pub alive: bool, // bit  63
+#[allow(dead_code)]
+mod recent {
+    use modular_bitfield::prelude::*;
+    #[bitfield(bits = 64)]
+    #[derive(Copy, Clone)]
+    pub(crate) struct RecentAlloc {
+        pub size: B30,   // bits  0-29: allocation size (max 1 GB)
+        pub offset: B30, // bits 30-59: arena offset   (max 1 GB)
+        #[skip]
+        __: B3, // bits 60-62: padding
+        pub alive: bool, // bit  63
+    }
 }
+
+use recent::RecentAlloc;
 
 // SAFETY: modular-bitfield uses repr([u8; 8]); all-zero bytes = alive=0 (dead)
 const DEAD_ALLOC: RecentAlloc = unsafe { core::mem::transmute::<[u8; 8], RecentAlloc>([0u8; 8]) };
@@ -73,7 +77,7 @@ impl<const N: usize> RingBuffer<N> {
     }
 
     /// Mark all entries with offset >= `from_offset` as dead.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn invalidate_from_offset(&mut self, from_offset: usize) {
         for i in 0..self.len {
             let idx = (self.head + N - 1 - i) % N;

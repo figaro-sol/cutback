@@ -13,10 +13,7 @@ pub mod test_harness;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
-#[cfg(not(any(test, fuzzing)))]
 use bump::MarkNode;
-#[cfg(any(test, fuzzing))]
-pub use bump::MarkNode;
 
 use bump::ScopedBumpInner;
 
@@ -44,16 +41,6 @@ impl<const N: usize> ScopedBump<N> {
     /// a valid region of at least `cap` bytes that outlives all allocations.
     pub unsafe fn init(&self, base: *mut u8, cap: usize) {
         unsafe { (*self.inner.get()).init(base, cap) }
-    }
-
-    #[cfg(any(test, fuzzing))]
-    pub unsafe fn push_mark(&self, node: &mut MarkNode<N>) {
-        (*self.inner.get()).push_mark(node);
-    }
-
-    #[cfg(any(test, fuzzing))]
-    pub unsafe fn pop_mark_and_reset(&self) {
-        (*self.inner.get()).pop_mark_and_reset();
     }
 
     /// # Safety
